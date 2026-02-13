@@ -1,4 +1,4 @@
-```
+
 # Ion-gel-hysteresis-algorithm
 
 用于离子凝胶压力传感器迟滞（Hysteresis）补偿的 Python 实时流式算法框架。
@@ -32,6 +32,4 @@ python hysteresis_framework.py
   1) 当前采样低通，2) play 状态更新，3) 点积输出，满足实时任务调度需求。
 - 状态变量只有 `states` 与 `y_lp`，易于放入 MCU/RTOS 的对象或结构体中。
 
-```
 
-```
