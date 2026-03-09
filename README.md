@@ -4,6 +4,15 @@
 
 ## 模块结构
 - `signal_generator.py`：生成“真实压力 + 高斯噪声观测”的模拟数据。
+- `hysteresis_framework.py`：实时一维卡尔曼滤波去噪引擎，支持读取 `tcdata.txt` 并输出处理前后图像。
+- `pi_operators.py`：历史文件，当前简化流程未使用。
+
+## 使用你的数据（推荐）
+准备 `tcdata.txt`，格式为两列：
+1. 第一列：时间
+2. 第二列：电容值
+
+运行：
 - `hysteresis_framework.py`：实时一维卡尔曼滤波去噪引擎 + 演示入口。
 - `pi_operators.py`：历史文件，当前简化流程未使用。
 
@@ -14,11 +23,22 @@
 
 ## 运行方式
 ```bash
-python hysteresis_framework.py
+python hysteresis_framework.py --data-file tcdata.txt
 ```
 
-运行后将：
+将输出：
+- `tcdata_before.png`：处理前原始电容信号。
+- `tcdata_after.png`：卡尔曼滤波后的电容信号。
 
+可调参数：
+```bash
+python hysteresis_framework.py --data-file tcdata.txt --process-var 1e-5 --measure-var 1e-3
+```
+
+## 无数据文件时
+如果未找到 `tcdata.txt`，程序会自动回退到内置模拟 demo，并输出 `kalman_denoise_demo.png`。
+
+## 迁移到 C++/嵌入式提示
 1. 在终端打印去噪前后 RMSE。
 2. 在仓库目录输出图像 `kalman_denoise_demo.png`。
 

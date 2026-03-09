@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+import argparse
+
 import numpy as np
 
 from signal_generator import NoisySignalGenerator, SignalSimulatorConfig
@@ -27,6 +30,9 @@ class RealTimeKalmanDenoiser:
             self._initialized = True
             return self.x_hat
 
+        x_pred = self.x_hat
+        p_pred = self.p + self.q
+
         # 预测（状态模型：x_k = x_{k-1} + w_k）
         x_pred = self.x_hat
         p_pred = self.p + self.q
@@ -42,6 +48,91 @@ def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
 
 
+def apply_kalman_filter(signal: np.ndarray, process_var: float, measure_var: float) -> np.ndarray:
+    denoiser = RealTimeKalmanDenoiser(process_var=process_var, measure_var=measure_var)
+    filtered = np.zeros_like(signal, dtype=float)
+    for k, z in enumerate(signal):
+        filtered[k] = denoiser.update(float(z))
+    return filtered
+
+
+def load_tc_data(data_path: str) -> tuple[np.ndarray, np.ndarray]:
+    data = np.genfromtxt(data_path, dtype=float)
+    if data.ndim != 2 or data.shape[1] < 2:
+        raise ValueError("tcdata.txt 格式错误：应至少包含两列（时间, 电容值）")
+
+    t = np.asarray(data[:, 0], dtype=float)
+    cap = np.asarray(data[:, 1], dtype=float)
+
+    valid = ~(np.isnan(t) | np.isnan(cap))
+    t = t[valid]
+    cap = cap[valid]
+
+    if t.size < 2:
+        raise ValueError("有效数据点不足，无法滤波")
+
+    return t, cap
+
+
+def plot_before_after(
+    t: np.ndarray,
+    raw: np.ndarray,
+    filtered: np.ndarray,
+    before_path: str = "tcdata_before.png",
+    after_path: str = "tcdata_after.png",
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        print("matplotlib 未安装，跳过绘图。")
+        return
+
+    try:
+        plt.rcParams["font.sans-serif"] = ["SimHei"]
+        plt.rcParams["axes.unicode_minus"] = False
+    except Exception:
+        pass
+
+    plt.figure(figsize=(11, 5))
+    plt.plot(t, raw, color="tab:orange", label="原始电容信号")
+    plt.xlabel("时间")
+    plt.ylabel("电容值")
+    plt.title("处理前：原始信号")
+    plt.legend()
+    plt.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(before_path, dpi=130)
+    plt.close()
+
+    plt.figure(figsize=(11, 5))
+    plt.plot(t, filtered, color="tab:blue", label="卡尔曼滤波后信号")
+    plt.xlabel("时间")
+    plt.ylabel("电容值")
+    plt.title("处理后：卡尔曼滤波信号")
+    plt.legend()
+    plt.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(after_path, dpi=130)
+    plt.close()
+
+
+def run_from_file(
+    data_path: str = "tcdata.txt",
+    process_var: float = 1e-5,
+    measure_var: float = 1e-3,
+) -> None:
+    t, cap = load_tc_data(data_path)
+    cap_hat = apply_kalman_filter(cap, process_var=process_var, measure_var=measure_var)
+
+    print("=== tcdata Kalman Denoising ===")
+    print(f"数据文件: {data_path}")
+    print(f"样本点数: {cap.size}")
+    print(f"RMSE(滤波前 vs 滤波后): {rmse(cap, cap_hat):.6f}")
+
+    plot_before_after(t, cap, cap_hat)
+    print("已输出图像: tcdata_before.png, tcdata_after.png")
+
+
 def run_demo(show_plot: bool = True, save_path: str = "kalman_denoise_demo.png") -> None:
     try:
         import matplotlib.pyplot as plt
@@ -52,6 +143,7 @@ def run_demo(show_plot: bool = True, save_path: str = "kalman_denoise_demo.png")
     generator = NoisySignalGenerator(cfg)
     t, p_true, noisy_obs = generator.generate()
 
+    p_hat = apply_kalman_filter(noisy_obs, process_var=5e-5, measure_var=cfg.noise_std**2)
     denoiser = RealTimeKalmanDenoiser(process_var=5e-5, measure_var=cfg.noise_std**2)
     p_hat = np.zeros_like(p_true)
     for k, z in enumerate(noisy_obs):
@@ -90,5 +182,20 @@ def run_demo(show_plot: bool = True, save_path: str = "kalman_denoise_demo.png")
     plt.close()
 
 
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Kalman实时降噪")
+    parser.add_argument("--data-file", default="tcdata.txt", help="输入数据文件路径（两列：时间、电容值）")
+    parser.add_argument("--process-var", type=float, default=1e-5, help="过程噪声方差 Q")
+    parser.add_argument("--measure-var", type=float, default=1e-3, help="观测噪声方差 R")
+    args = parser.parse_args()
+
+    if Path(args.data_file).exists():
+        run_from_file(args.data_file, process_var=args.process_var, measure_var=args.measure_var)
+    else:
+        print(f"未找到 {args.data_file}，回退到内置 demo。")
+        run_demo(show_plot=False)
+
+
 if __name__ == "__main__":
+    main()
     run_demo(show_plot=False)
