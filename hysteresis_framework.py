@@ -33,6 +33,11 @@ class RealTimeKalmanDenoiser:
         x_pred = self.x_hat
         p_pred = self.p + self.q
 
+        # 预测（状态模型：x_k = x_{k-1} + w_k）
+        x_pred = self.x_hat
+        p_pred = self.p + self.q
+
+        # 更新
         k_gain = p_pred / (p_pred + self.r)
         self.x_hat = x_pred + k_gain * (float(z_t) - x_pred)
         self.p = (1.0 - k_gain) * p_pred
@@ -139,6 +144,10 @@ def run_demo(show_plot: bool = True, save_path: str = "kalman_denoise_demo.png")
     t, p_true, noisy_obs = generator.generate()
 
     p_hat = apply_kalman_filter(noisy_obs, process_var=5e-5, measure_var=cfg.noise_std**2)
+    denoiser = RealTimeKalmanDenoiser(process_var=5e-5, measure_var=cfg.noise_std**2)
+    p_hat = np.zeros_like(p_true)
+    for k, z in enumerate(noisy_obs):
+        p_hat[k] = denoiser.update(float(z))
 
     e_in = rmse(p_true, noisy_obs)
     e_out = rmse(p_true, p_hat)
@@ -189,3 +198,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    run_demo(show_plot=False)
