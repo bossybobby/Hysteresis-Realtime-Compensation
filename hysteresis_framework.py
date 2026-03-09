@@ -1,137 +1,169 @@
-"""实时流式离子凝胶压力传感器迟滞补偿框架。"""
+"""实时流式压力信号降噪框架（以卡尔曼滤波为主）。"""
 
 from __future__ import annotations
 
+from pathlib import Path
+import argparse
+
 import numpy as np
-from scipy.optimize import nnls
 
-from pi_operators import update_play_bank
-from signal_generator import PIHysteresisGenerator, PISimulatorConfig
-import matplotlib.pyplot as plt 
-
-# --------------------------------
-# 1) Offline identification (NNLS)
-# --------------------------------
-
-def build_play_feature_matrix(signal: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
-    """通过一次顺序扫描构建 PI 特征矩阵 Phi。
-
-    Phi[k, i] = 第 i 个 play operator 在时刻 k 的输出。
-    """
-    x = np.asarray(signal, dtype=float)
-    r = np.asarray(thresholds, dtype=float)
-    n = x.size
-    m = r.size
-
-    phi = np.zeros((n, m), dtype=float)
-    states = np.zeros(m, dtype=float)
-
-    for k in range(n):
-        states = update_play_bank(x[k], states, r)
-        phi[k, :] = states
-
-    return phi
+from signal_generator import NoisySignalGenerator, SignalSimulatorConfig
 
 
-def identify_inverse_weights_nnls(v_meas: np.ndarray, p_true: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
-    """辨识逆模型权重：p ≈ Phi(v) @ w_inv，其中 w_inv >= 0。"""
-    phi_v = build_play_feature_matrix(v_meas, thresholds)
-    w_inv, _ = nnls(phi_v, p_true)
-    return w_inv
+class RealTimeKalmanDenoiser:
+    """一维卡尔曼滤波器（严格因果）。"""
 
+    def __init__(self, process_var: float = 1e-4, measure_var: float = 2.5e-3):
+        if process_var <= 0.0 or measure_var <= 0.0:
+            raise ValueError("process_var 与 measure_var 必须为正数")
 
-# --------------------------------
-# 2) Real-time compensation engine
-# --------------------------------
+        self.q = float(process_var)
+        self.r = float(measure_var)
+        self.x_hat = 0.0
+        self.p = 1.0
+        self._initialized = False
 
-class RealTimePICompensator:
-    """实时 PI 迟滞补偿引擎（严格因果）。"""
+    def update(self, z_t: float) -> float:
+        """输入当前观测值，输出当前去噪估计。"""
+        if not self._initialized:
+            self.x_hat = float(z_t)
+            self._initialized = True
+            return self.x_hat
 
-    def __init__(self, thresholds: np.ndarray, inv_weights: np.ndarray, alpha: float = 0.2):
-        self.thresholds = np.asarray(thresholds, dtype=float)
-        self.inv_weights = np.asarray(inv_weights, dtype=float)
+        x_pred = self.x_hat
+        p_pred = self.p + self.q
 
-        if self.thresholds.size != self.inv_weights.size:
-            raise ValueError("thresholds 与 inv_weights 维度不一致")
-        if not (0.0 < alpha <= 1.0):
-            raise ValueError("IIR alpha 需满足 0 < alpha <= 1")
+        k_gain = p_pred / (p_pred + self.r)
+        self.x_hat = x_pred + k_gain * (float(z_t) - x_pred)
+        self.p = (1.0 - k_gain) * p_pred
+        return self.x_hat
 
-        self.alpha = float(alpha)
-        self.states = np.zeros_like(self.thresholds)
-        self.y_lp = 0.0
-        self._lp_initialized = False
-
-    def _lowpass(self, x_t: float) -> float:
-        """一阶 IIR: y[k] = alpha*x[k] + (1-alpha)*y[k-1]。"""
-        if not self._lp_initialized:
-            self.y_lp = x_t
-            self._lp_initialized = True
-        else:
-            self.y_lp = self.alpha * x_t + (1.0 - self.alpha) * self.y_lp
-        return self.y_lp
-
-    def update(self, v_in: float) -> float:
-        """输入当前电压采样，输出当前补偿压力估计。"""
-        v_f = self._lowpass(v_in)
-        self.states = update_play_bank(v_f, self.states, self.thresholds)
-        return float(self.inv_weights @ self.states)
-
-
-# -----------------------------
-# 3) Demo / validation routine
-# -----------------------------
 
 def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
 
 
-def run_demo(show_plot: bool = True, save_path: str = "hysteresis_demo.png") -> None:
+def apply_kalman_filter(signal: np.ndarray, process_var: float, measure_var: float) -> np.ndarray:
+    denoiser = RealTimeKalmanDenoiser(process_var=process_var, measure_var=measure_var)
+    filtered = np.zeros_like(signal, dtype=float)
+    for k, z in enumerate(signal):
+        filtered[k] = denoiser.update(float(z))
+    return filtered
+
+
+def load_tc_data(data_path: str) -> tuple[np.ndarray, np.ndarray]:
+    data = np.genfromtxt(data_path, dtype=float)
+    if data.ndim != 2 or data.shape[1] < 2:
+        raise ValueError("tcdata.txt 格式错误：应至少包含两列（时间, 电容值）")
+
+    t = np.asarray(data[:, 0], dtype=float)
+    cap = np.asarray(data[:, 1], dtype=float)
+
+    valid = ~(np.isnan(t) | np.isnan(cap))
+    t = t[valid]
+    cap = cap[valid]
+
+    if t.size < 2:
+        raise ValueError("有效数据点不足，无法滤波")
+
+    return t, cap
+
+
+def plot_before_after(
+    t: np.ndarray,
+    raw: np.ndarray,
+    filtered: np.ndarray,
+    before_path: str = "tcdata_before.png",
+    after_path: str = "tcdata_after.png",
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        print("matplotlib 未安装，跳过绘图。")
+        return
+
+    try:
+        plt.rcParams["font.sans-serif"] = ["SimHei"]
+        plt.rcParams["axes.unicode_minus"] = False
+    except Exception:
+        pass
+
+    plt.figure(figsize=(11, 5))
+    plt.plot(t, raw, color="tab:orange", label="原始电容信号")
+    plt.xlabel("时间")
+    plt.ylabel("电容值")
+    plt.title("处理前：原始信号")
+    plt.legend()
+    plt.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(before_path, dpi=130)
+    plt.close()
+
+    plt.figure(figsize=(11, 5))
+    plt.plot(t, filtered, color="tab:blue", label="卡尔曼滤波后信号")
+    plt.xlabel("时间")
+    plt.ylabel("电容值")
+    plt.title("处理后：卡尔曼滤波信号")
+    plt.legend()
+    plt.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(after_path, dpi=130)
+    plt.close()
+
+
+def run_from_file(
+    data_path: str = "tcdata.txt",
+    process_var: float = 1e-5,
+    measure_var: float = 1e-3,
+) -> None:
+    t, cap = load_tc_data(data_path)
+    cap_hat = apply_kalman_filter(cap, process_var=process_var, measure_var=measure_var)
+
+    print("=== tcdata Kalman Denoising ===")
+    print(f"数据文件: {data_path}")
+    print(f"样本点数: {cap.size}")
+    print(f"RMSE(滤波前 vs 滤波后): {rmse(cap, cap_hat):.6f}")
+
+    plot_before_after(t, cap, cap_hat)
+    print("已输出图像: tcdata_before.png, tcdata_after.png")
+
+
+def run_demo(show_plot: bool = True, save_path: str = "kalman_denoise_demo.png") -> None:
     try:
         import matplotlib.pyplot as plt
     except ModuleNotFoundError:
         plt = None
 
-    # 真实系统（用于模拟数据）
-    model_thresholds = np.linspace(0.01, 0.25, 18)
-    model_weights = np.exp(-5.2 * model_thresholds)
-    model_weights /= model_weights.sum()
+    cfg = SignalSimulatorConfig(fs=200.0, duration=24.0, noise_std=0.05, seed=123)
+    generator = NoisySignalGenerator(cfg)
+    t, p_true, noisy_obs = generator.generate()
 
-    cfg = PISimulatorConfig(fs=200.0, duration=24.0, noise_std=0.025, seed=123)
-    generator = PIHysteresisGenerator(model_thresholds, model_weights, cfg)
-    t, p_true, v_meas = generator.generate()
+    p_hat = apply_kalman_filter(noisy_obs, process_var=5e-5, measure_var=cfg.noise_std**2)
 
-    # 离线辨识：构造逆模型 p <- v
-    id_thresholds = np.linspace(0.005, 0.28, 24)
-    w_inv = identify_inverse_weights_nnls(v_meas, p_true, id_thresholds)
-
-    # 在线引擎：逐点 update
-    engine = RealTimePICompensator(id_thresholds, w_inv, alpha=0.22)
-    p_hat = np.zeros_like(p_true)
-    for k, v in enumerate(v_meas):
-        p_hat[k] = engine.update(float(v))
-
-    e_in = rmse(p_true, v_meas)
+    e_in = rmse(p_true, noisy_obs)
     e_out = rmse(p_true, p_hat)
 
-    print("=== Hysteresis Compensation Metrics ===")
-    print(f"RMSE(原始带迟滞噪声电压 vs 压力): {e_in:.6f}")
-    print(f"RMSE(实时补偿压力估计 vs 压力): {e_out:.6f}")
+    print("=== Kalman Denoising Metrics ===")
+    print(f"RMSE(原始带噪观测 vs 真实压力): {e_in:.6f}")
+    print(f"RMSE(卡尔曼去噪估计 vs 真实压力): {e_out:.6f}")
     print(f"Improvement ratio: {e_in / max(e_out, 1e-12):.2f}x")
 
-    plt.figure(figsize=(11, 6))
-    # 最简单的中文支持：直接设置 matplotlib rcParams，适用于大多数系统（需要已安装中文字体，如 SimHei）
+    if plt is None:
+        return
+
     try:
-        plt.rcParams['font.sans-serif'] = ['SimHei']
-        plt.rcParams['axes.unicode_minus'] = False
+        plt.rcParams["font.sans-serif"] = ["SimHei"]
+        plt.rcParams["axes.unicode_minus"] = False
     except Exception:
         pass
 
+    plt.figure(figsize=(11, 6))
     plt.plot(t, p_true, label="原始压力（真实值）", linewidth=2)
-    plt.plot(t, v_meas, label="带迟滞+噪声电压", alpha=0.75)
-    plt.plot(t, p_hat, label="实时补偿后的压力估计", linewidth=1.8)
+    plt.plot(t, noisy_obs, label="带噪观测", alpha=0.7)
+    plt.plot(t, p_hat, label="卡尔曼滤波去噪估计", linewidth=1.8)
     plt.xlabel("时间 (s)")
     plt.ylabel("幅值")
-    plt.title("离子凝胶传感器迟滞补偿（流式 PI + NNLS）")
+    plt.title("实时压力信号降噪（Kalman Filter）")
     plt.legend()
     plt.grid(alpha=0.25)
     plt.tight_layout()
@@ -141,5 +173,19 @@ def run_demo(show_plot: bool = True, save_path: str = "hysteresis_demo.png") -> 
     plt.close()
 
 
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Kalman实时降噪")
+    parser.add_argument("--data-file", default="tcdata.txt", help="输入数据文件路径（两列：时间、电容值）")
+    parser.add_argument("--process-var", type=float, default=1e-5, help="过程噪声方差 Q")
+    parser.add_argument("--measure-var", type=float, default=1e-3, help="观测噪声方差 R")
+    args = parser.parse_args()
+
+    if Path(args.data_file).exists():
+        run_from_file(args.data_file, process_var=args.process_var, measure_var=args.measure_var)
+    else:
+        print(f"未找到 {args.data_file}，回退到内置 demo。")
+        run_demo(show_plot=False)
+
+
 if __name__ == "__main__":
-    run_demo(show_plot=False)
+    main()
